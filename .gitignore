@@ -1,0 +1,14 @@
+
+
+/.idea
+commands.txt
+results/*
+*.prof
+*.pickle
+lightning_logs/*
+wandb/*
+runs/*
+tensorboard_logs/*
+checkpoints/*
+params.txt
+postgres-conf.txt
