@@ -49,4 +49,4 @@ def load_job_extended(schema_id: int, path: str, query_db: QueryDB):
 
 
 # Example usage
-load_job_extended(1, "/home/silvan/code/imdb-sqls", QueryDB("query_db", 5443))
+# load_job_extended(1, "/home/silvan/code/imdb-sqls", QueryDB("query_db", 5443))

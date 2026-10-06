@@ -4,6 +4,7 @@ from typing import FrozenSet, List, Optional, Dict
 from frozenlist import FrozenList
 
 import queries.predicates.conjunction
+from queries.predicates.comparison_predicate import ComparisonPredicate
 from queries.predicates.negation import Negation
 from queries.predicates.predicate import Predicate
 from queries.predicates.simple_predicate import SimplePredicate
@@ -54,7 +55,7 @@ class Disjunction(Predicate):
         return True
 
     def _check_normal_form(self) -> bool:
-        return len(self._predicates) > 1 and all((isinstance(predicate, Negation) or isinstance(predicate, SimplePredicate)) and predicate.check_normal_form() for predicate in self._predicates)
+        return len(self._predicates) > 1 and all((isinstance(predicate, Negation) or isinstance(predicate, (SimplePredicate, ComparisonPredicate))) and predicate.check_normal_form() for predicate in self._predicates)
 
     def _get_normal_form(self) -> Optional[Predicate]:
         normal_form_predicates = [[]]

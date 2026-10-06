@@ -6,7 +6,8 @@ import numpy as np
 from cardinality_estimators.cardinality_estimator import CardinalityEstimator, CardinalityMode
 from cost_models.cost_model import CostModel
 from cost_models.local_cost_model import LocalCostModel
-from queries.predicates.comparison_operator import COMPARISON_OPERATOR_EQ, COMPARISON_OPERATOR_IN, COMPARISON_OPERATOR_LIKE, COMPARISON_OPERATOR_ILIKE
+from queries.predicates.comparison_operator import COMPARISON_OPERATOR_EQ, COMPARISON_OPERATOR_IN, COMPARISON_OPERATOR_LIKE, COMPARISON_OPERATOR_ILIKE, COMPARISON_OPERATOR_LT, COMPARISON_OPERATOR_LTE, COMPARISON_OPERATOR_GT, COMPARISON_OPERATOR_GTE
+from queries.predicates.comparison_predicate import ComparisonPredicate
 from queries.predicates.conjunction import Conjunction
 from queries.predicates.disjunction import Disjunction
 from queries.predicates.join import Join
@@ -164,6 +165,8 @@ class PostgreSQLCostModel(LocalCostModel):
                 return self._postgresql_configuration.cpu_operator_cost
         elif isinstance(predicate, Join):
             return self._postgresql_configuration.cpu_operator_cost
+        elif isinstance(predicate, ComparisonPredicate):
+            return self._postgresql_configuration.cpu_operator_cost
         else:
             raise NotImplementedError
 
@@ -292,10 +295,6 @@ class PostgreSQLCostModel(LocalCostModel):
                     nd_str = f"{class_ndistinct:.1f}" if class_ndistinct is not None else "None"
                     print(f"      [HashJoin class] ndistinct={nd_str} mcv={class_mcv:.3e}")
 
-            if not per_class_stats:
-                # All classes pruned (shouldn't happen); fall back to uniform.
-                per_class_stats = [(1.0, 0.0)]
-
             # Combine ndistinct and MCV across equivalence classes.
             # Interpolate (geometric mean) between the correlated and independent
             # extremes, with products bounded by physical limits.
@@ -304,6 +303,7 @@ class PostgreSQLCostModel(LocalCostModel):
             for nd, mcv in per_class_stats:
                 if nd is None:
                     nd = max(1.0, 1.0 / max(0.1, mcv))
+                nd = max(nd, 1)
                 effective_mcv = mcv if mcv > 0 else 1.0 / nd
                 ndistincts.append(nd)
                 mcvs.append(effective_mcv)
@@ -908,6 +908,53 @@ class PostgreSQLCostModel(LocalCostModel):
         else:
             return False
 
+    @staticmethod
+    def _prefix_bound_query(parent_query: SPJQuery, inner_table_occurrence: TableOccurrence, prefix_columns: Set[Column]) -> Optional[SPJQuery]:
+        """Query whose cardinality equals the index entries walked across all probes of
+        an index nested loop: the parent query constrained only by what the index prefix
+        enforces, i.e. join conjuncts and equality predicates on prefix columns of the
+        inner table. Join conjuncts and predicates outside the prefix are applied as
+        filters after the index walk and must not constrain the bound. Returns None if
+        no join conjunct is covered by the prefix, since the reduced query would not
+        connect the inner table."""
+        if len(parent_query.non_equi_join_predicates()) > 0:
+            return None
+        covered = any(table_occurrence == inner_table_occurrence and column in prefix_columns
+                      for join in parent_query.joins()
+                      for table_occurrence, column in join.equivalence_class())
+        if not covered:
+            return None
+        predicate = inner_table_occurrence.predicate()
+        if isinstance(predicate, Conjunction):
+            predicates = predicate.predicates()
+        else:
+            predicates = [predicate]
+        kept_predicates = [p for p in predicates
+                           if isinstance(p, SimplePredicate) and p.operator() == COMPARISON_OPERATOR_EQ and p.column() in prefix_columns]
+        new_inner_table_occurrence = TableOccurrence(inner_table_occurrence.table(), inner_table_occurrence.alias())
+        if len(kept_predicates) == 0:
+            new_predicate = TruePredicate()
+        elif len(kept_predicates) == 1:
+            new_predicate = kept_predicates[0]
+        else:
+            new_predicate = Conjunction(kept_predicates)
+        new_predicate = new_predicate.replace({inner_table_occurrence: new_inner_table_occurrence})
+        new_inner_table_occurrence.set_predicate(new_predicate)
+        table_occurrences = [new_inner_table_occurrence if table_occurrence == inner_table_occurrence else table_occurrence
+                             for table_occurrence in parent_query.table_occurrences()]
+        joins = []
+        for join in parent_query.joins():
+            equivalence_class = []
+            for table_occurrence, column in join.equivalence_class():
+                if table_occurrence == inner_table_occurrence:
+                    if column in prefix_columns:
+                        equivalence_class.append((new_inner_table_occurrence, column))
+                else:
+                    equivalence_class.append((table_occurrence, column))
+            if len(equivalence_class) > 1:
+                joins.append(Join(equivalence_class))
+        return SPJQuery(table_occurrences, joins, [])
+
     def _cost_rescan(self, parent_relational_algebra_expression: RelationalAlgebraExpression, relational_algebra_expression: RelationalAlgebraExpression, loop_count: int, non_memoized_ratio: float, cardinality_mode: CardinalityMode) -> Optional[Tuple[float, float]]:
         # Returning upfront costs and per rescan costs
         if self._is_index_scan(relational_algebra_expression):
@@ -924,15 +971,6 @@ class PostgreSQLCostModel(LocalCostModel):
             min_cardinality = self.cardinality_estimator.estimate(parent_query, cardinality_mode=CardinalityMode.MIN)
             if min_cardinality is None:
                 min_cardinality = 0.0
-            unfiltered_parent_query = parent_query.remove_predicate(index_scan_expression.table_occurrence)
-            min_unfiltered_cardinality = self.cardinality_estimator.estimate(unfiltered_parent_query, cardinality_mode=CardinalityMode.MIN)
-            if min_unfiltered_cardinality is None:
-                min_unfiltered_cardinality = 0.0
-            min_unfiltered_cardinality = max(min_cardinality, min_unfiltered_cardinality)
-            min_unfiltered_cardinality = min_unfiltered_cardinality * non_memoized_ratio
-            max_unfiltered_cardinality = self.cardinality_estimator.estimate(unfiltered_parent_query, cardinality_mode=CardinalityMode.MAX)
-            if max_unfiltered_cardinality is not None:
-                max_unfiltered_cardinality = max_unfiltered_cardinality * non_memoized_ratio
             # Determine which inner columns are covered by join conditions or equality
             # predicates so that _bt_cost_estimate uses the full useful index prefix.
             matched_columns = None
@@ -949,6 +987,22 @@ class PostgreSQLCostModel(LocalCostModel):
                             matched_columns.add(p.column())
                 elif isinstance(inner_predicate, SimplePredicate) and inner_predicate.operator() == COMPARISON_OPERATOR_EQ:
                     matched_columns.add(inner_predicate.column())
+            # Bounds for num_index_tuples in _bt_cost_estimate: the parent query constrained only by
+            # the index prefix, see _prefix_bound_query.
+            unfiltered_parent_query = None
+            if matched_columns is not None and index_scan_expression.index is not None:
+                prefix_columns = set(self._matched_prefix_columns_for_index(index_scan_expression.index, matched_columns))
+                unfiltered_parent_query = self._prefix_bound_query(parent_query, index_scan_expression.table_occurrence, prefix_columns)
+            if unfiltered_parent_query is None:
+                unfiltered_parent_query = parent_query.remove_predicate(index_scan_expression.table_occurrence)
+            min_unfiltered_cardinality = self.cardinality_estimator.estimate(unfiltered_parent_query, cardinality_mode=CardinalityMode.MIN)
+            if min_unfiltered_cardinality is None:
+                min_unfiltered_cardinality = 0.0
+            min_unfiltered_cardinality = max(min_cardinality, min_unfiltered_cardinality)
+            min_unfiltered_cardinality = min_unfiltered_cardinality * non_memoized_ratio
+            max_unfiltered_cardinality = self.cardinality_estimator.estimate(unfiltered_parent_query, cardinality_mode=CardinalityMode.MAX)
+            if max_unfiltered_cardinality is not None:
+                max_unfiltered_cardinality = max_unfiltered_cardinality * non_memoized_ratio
             average_result = self._index_scan_cost(index_scan_expression,
                                                    loop_count=loop_count,
                                                    include_startup_cost=True,
@@ -1111,6 +1165,19 @@ class PostgreSQLCostModel(LocalCostModel):
             pages_fetched = math.ceil(pages_fetched)
         return pages_fetched
 
+    @staticmethod
+    def _matched_prefix_columns_for_index(index: Index, matched_columns: Optional[Set[Column]]) -> List[Column]:
+        """The leading index columns covered by matched_columns (all leading columns if
+        matched_columns is None) that carry statistics — the boundary prefix that
+        determines num_index_tuples in _bt_cost_estimate."""
+        matched_prefix_columns: List[Column] = []
+        for index_column in index.columns():
+            if matched_columns is not None and index_column not in matched_columns:
+                break
+            if index_column.distinct_count() is not None:
+                matched_prefix_columns.append(index_column)
+        return matched_prefix_columns
+
     def _bt_cost_estimate(self,
                           index: Index,
                           loop_count: int,
@@ -1121,14 +1188,8 @@ class PostgreSQLCostModel(LocalCostModel):
                           table: Table,
                           matched_columns: Optional[Set[Column]] = None) -> Tuple[float, float, float]:
         index_columns = index.columns()
-        matched_prefix_length = 0
-        matched_prefix_columns: List[Column] = []
-        for index_column in index_columns:
-            if matched_columns is not None and index_column not in matched_columns:
-                break
-            if index_column.distinct_count() is not None:
-                matched_prefix_length += 1
-                matched_prefix_columns.append(index_column)
+        matched_prefix_columns = self._matched_prefix_columns_for_index(index, matched_columns)
+        matched_prefix_length = len(matched_prefix_columns)
         index_tuples = index.tuples()
         index_pages = index.pages()
 
@@ -1138,24 +1199,16 @@ class PostgreSQLCostModel(LocalCostModel):
             # not per-rescan index entries read, so they don't apply here.
             num_index_tuples = float(table.cardinality())
         else:
-            num_index_tuples = None
+            # Index entries walked per probe: the prefix-bound cardinality of the parent query per
+            # probe for MIN and MAX, the statistics-based estimate clamped to that range for MEAN.
+            scans = max(loop_count, 1)
+            min_num_index_tuples = 0.0 if min_unfiltered_cardinality is None else min_unfiltered_cardinality / scans
+            max_num_index_tuples = float(index_tuples) if max_unfiltered_cardinality is None else max_unfiltered_cardinality / scans
             if cardinality_mode == CardinalityMode.MIN:
-                num_index_tuples = 0.0
-                if matched_columns is not None:
-                    lower_bound = self.composite_min_degree_lower_bound(table, matched_prefix_columns)
-                    if lower_bound is not None:
-                        num_index_tuples = float(lower_bound)
-            elif cardinality_mode == CardinalityMode.MAX and matched_columns is not None:
-                # max_degree is a per-key upper bound on inner rows and is only
-                # semantically aligned with MAX when the prefix columns are
-                # bound by an outer join condition or equality predicate. For
-                # standalone IndexScans (matched_columns=None), selectivity
-                # comes from a WHERE predicate, not a per-key lookup, so we
-                # fall through to the MEAN baseline.
-                max_deg = self.composite_max_degree(table, matched_prefix_columns)
-                if max_deg is not None:
-                    num_index_tuples = float(max_deg)
-            if num_index_tuples is None:
+                num_index_tuples = min_num_index_tuples
+            elif cardinality_mode == CardinalityMode.MAX:
+                num_index_tuples = max_num_index_tuples
+            else:
                 distinct_combinations = index.prefix_distinct_count(matched_prefix_length)
                 if distinct_combinations < 1:
                     distinct_combinations = 1
@@ -1168,16 +1221,18 @@ class PostgreSQLCostModel(LocalCostModel):
                 if len(null_fractions) > 0:
                     null_fraction = 1 - np.prod([1 - nf for nf in null_fractions])
                     num_index_tuples = num_index_tuples * (1 - null_fraction)
+                num_index_tuples = min(max(num_index_tuples, min_num_index_tuples), max_num_index_tuples)
 
-            if cardinality_mode in (CardinalityMode.MIN, CardinalityMode.MEAN) and min_unfiltered_cardinality is not None:
-                min_num_index_tuples = min_unfiltered_cardinality / max(loop_count, 1)
-                if num_index_tuples < min_num_index_tuples:
-                    num_index_tuples = min_num_index_tuples
-
-            if cardinality_mode in (CardinalityMode.MAX, CardinalityMode.MEAN) and max_unfiltered_cardinality is not None:
-                max_num_index_tuples = max_unfiltered_cardinality / max(loop_count, 1)
-                if num_index_tuples > max_num_index_tuples:
-                    num_index_tuples = max_num_index_tuples
+            # Per-key degree bounds of the index prefix. They only apply when the prefix columns are
+            # bound by an outer join condition or equality predicate; for standalone IndexScans
+            # (matched_columns=None) selectivity comes from a WHERE predicate, not a per-key lookup.
+            if matched_columns is not None:
+                max_degree = self.composite_max_degree(table, matched_prefix_columns)
+                if max_degree is not None and num_index_tuples > max_degree:
+                    num_index_tuples = float(max_degree)
+                min_degree = self.composite_min_degree_lower_bound(table, matched_prefix_columns)
+                if min_degree is not None and num_index_tuples < min_degree:
+                    num_index_tuples = float(min_degree)
 
         if num_index_tuples > index_tuples:
             num_index_tuples = index_tuples
@@ -1221,6 +1276,9 @@ class PostgreSQLCostModel(LocalCostModel):
         correlation = index.columns()[0].correlation()
         if correlation is None:
             correlation = 0.0
+        # btcostestimate discounts the first column's correlation for multi-column indexes.
+        if len(index_columns) > 1:
+            correlation *= 0.75
 
         return total_cost, index_selectivity, correlation
 
@@ -1228,6 +1286,7 @@ class PostgreSQLCostModel(LocalCostModel):
         column_distinct_count = column.distinct_count()
         if column_distinct_count is None:
             return None
+        column_distinct_count = max(1, column_distinct_count)
         table_cardinality = table_occurrence.table().cardinality()
         table_occurrence_query = SPJQuery([table_occurrence], [], [])
         table_occurrence_cardinality = self.cardinality_estimator.estimate(table_occurrence_query, cardinality_mode=cardinality_mode)
@@ -1247,7 +1306,6 @@ class PostgreSQLCostModel(LocalCostModel):
         table = table_occurrence.table()
         index = index_scan_expression.index
         index_columns = index.columns()
-        unfiltered_table_occurrence = TableOccurrence(table, table_occurrence.alias())
         min_cardinality = self.cardinality_estimator.estimate(index_scan_expression.query(), cardinality_mode=CardinalityMode.MIN)
         if min_cardinality is None:
             min_cardinality = 0.0
@@ -1256,25 +1314,48 @@ class PostgreSQLCostModel(LocalCostModel):
             predicates = predicate.predicates()
         else:
             predicates = [predicate]
-        unfiltered_predicates = []
+        # Predicates not on index columns are evaluated as the heap filter and stay
+        # charged per fetched tuple in _index_scan_cost.
+        filter_predicates = []
         for predicate in predicates:
             if not isinstance(predicate, SimplePredicate) or predicate.column() not in index_columns:
-                unfiltered_predicates.append(predicate)
-        if len(unfiltered_predicates) == 0:
-            unfiltered_predicate = TruePredicate()
-        elif len(unfiltered_predicates) == 1:
-            unfiltered_predicate = unfiltered_predicates[0]
+                filter_predicates.append(predicate)
+        if len(filter_predicates) == 0:
+            filter_predicate = TruePredicate()
+        elif len(filter_predicates) == 1:
+            filter_predicate = filter_predicates[0]
         else:
-            unfiltered_predicate = Conjunction(unfiltered_predicates)
-        unfiltered_predicate = unfiltered_predicate.replace({table_occurrence: unfiltered_table_occurrence})
-        unfiltered_table_occurrence.set_predicate(unfiltered_predicate)
-        unfiltered_query = SPJQuery([unfiltered_table_occurrence], [], [])
-        min_unfiltered_cardinality = self.cardinality_estimator.estimate(unfiltered_query, cardinality_mode=CardinalityMode.MIN)
+            filter_predicate = Conjunction(filter_predicates)
+        # num_index_tuples counts the index entries matching the boundary quals: the
+        # predicates on a leading consecutive prefix of the index columns (equalities,
+        # plus range predicates on the column that ends the prefix). The bound query
+        # keeps exactly those predicates, so its cardinality equals that entry count.
+        boundary_operators = (COMPARISON_OPERATOR_EQ, COMPARISON_OPERATOR_LT, COMPARISON_OPERATOR_LTE, COMPARISON_OPERATOR_GT, COMPARISON_OPERATOR_GTE, COMPARISON_OPERATOR_IN)
+        boundary_predicates = []
+        for index_column in index_columns:
+            column_predicates = [p for p in predicates
+                                 if isinstance(p, SimplePredicate) and p.column() == index_column and p.operator() in boundary_operators]
+            if len(column_predicates) == 0:
+                break
+            boundary_predicates.extend(column_predicates)
+            if any(p.operator() != COMPARISON_OPERATOR_EQ for p in column_predicates):
+                break
+        bound_table_occurrence = TableOccurrence(table, table_occurrence.alias())
+        if len(boundary_predicates) == 0:
+            bound_predicate = TruePredicate()
+        elif len(boundary_predicates) == 1:
+            bound_predicate = boundary_predicates[0]
+        else:
+            bound_predicate = Conjunction(boundary_predicates)
+        bound_predicate = bound_predicate.replace({table_occurrence: bound_table_occurrence})
+        bound_table_occurrence.set_predicate(bound_predicate)
+        bound_query = SPJQuery([bound_table_occurrence], [], [])
+        min_unfiltered_cardinality = self.cardinality_estimator.estimate(bound_query, cardinality_mode=CardinalityMode.MIN)
         if min_unfiltered_cardinality is None:
             min_unfiltered_cardinality = 0.0
         min_unfiltered_cardinality = max(min_cardinality, min_unfiltered_cardinality)
-        max_unfiltered_cardinality = self.cardinality_estimator.estimate(unfiltered_query, cardinality_mode=CardinalityMode.MAX)
-        index_scan_result = self._index_scan_cost(index_scan_expression, min_unfiltered_cardinality=min_unfiltered_cardinality, max_unfiltered_cardinality=max_unfiltered_cardinality, predicate=unfiltered_predicate, cardinality_mode=cardinality_mode)
+        max_unfiltered_cardinality = self.cardinality_estimator.estimate(bound_query, cardinality_mode=CardinalityMode.MAX)
+        index_scan_result = self._index_scan_cost(index_scan_expression, min_unfiltered_cardinality=min_unfiltered_cardinality, max_unfiltered_cardinality=max_unfiltered_cardinality, predicate=filter_predicate, cardinality_mode=cardinality_mode)
         if index_scan_result is None:
             return None
         index_scan_cost, _ = index_scan_result

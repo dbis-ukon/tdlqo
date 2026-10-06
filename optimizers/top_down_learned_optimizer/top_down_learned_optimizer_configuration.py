@@ -98,7 +98,8 @@ class TopDownLearnedOptimizerConfiguration:
                  probe_max_min_ratio_threshold: float,
                  probe_per_probe_time_budget: float,
                  probe_fetch_size: int,
-                 composite_max_degree_scaling: bool):
+                 composite_max_degree_scaling: bool,
+                 correct_target_violations: bool = False):
         self.name = name
         self.description = description
         self.cost_model = cost_model
@@ -147,6 +148,9 @@ class TopDownLearnedOptimizerConfiguration:
         self.probe_per_probe_time_budget = probe_per_probe_time_budget
         self.probe_fetch_size = probe_fetch_size
         self.composite_max_degree_scaling = composite_max_degree_scaling
+        # Widen every training target interval that does not contain the local cost under the true
+        # cardinalities just enough to contain it. Needs the true cardinality cost model of the optimizer.
+        self.correct_target_violations = correct_target_violations
 
     @staticmethod
     def default_configuration(schema: Schema) -> TopDownLearnedOptimizerConfiguration:
@@ -179,104 +183,41 @@ class TopDownLearnedOptimizerConfiguration:
                                                     0,
                                                     16,
                                                     True,
-                                                    16,
+                                                    32,
                                                     ActivationFunction.PRELU,
-                                                    [16],
+                                                    [64],
                                                     [8],
-                                                    [MessagePassingLayerConfiguration(16, 4, 4, 16, True), MessagePassingLayerConfiguration(16, 4, 4, 16, True)],
+                                                    [MessagePassingLayerConfiguration(32, 4, 8, 32, True), MessagePassingLayerConfiguration(32, 4, 8, 32, True), MessagePassingLayerConfiguration(32, 4, 8, 32, True)],
                                                     True,
-                                                    MultiHeadAggregationConfiguration(4, 2, True),
-                                                    MultiHeadAggregationConfiguration(4, 4, True),
-                                                    MultiHeadAggregationConfiguration(4, 2, True),
-                                                    [32],
+                                                    MultiHeadAggregationConfiguration(128, 4, True),
+                                                    MultiHeadAggregationConfiguration(128, 4, True),
+                                                    MultiHeadAggregationConfiguration(8, 2, True),
+                                                    [256],
                                                     None,
-                                                    [16],
-                                                    [16],
+                                                    [256],
+                                                    [64],
                                                     False,
                                                     None,
                                                     2.0,
-                                                    30.0,
+                                                    60.0,
                                                     10000,
                                                     False)
 
     @staticmethod
-    def huge_neural_network_configuration(schema: Schema) -> TopDownLearnedOptimizerConfiguration:
+    def no_cardinality_deduction_configuration(schema: Schema) -> TopDownLearnedOptimizerConfiguration:
         configuration = TopDownLearnedOptimizerConfiguration.default_configuration(schema)
-        configuration.name = "Huge Neural Network"
-        configuration.description = "Huge neural network configuration"
-        configuration.table_specific_hidden_size = 32
-        configuration.node_layer_sizes = [32]
-        configuration.edge_layer_sizes = [16]
-        configuration.message_passing_layer_configurations = [
-            MessagePassingLayerConfiguration(32, 4, 8, 32, True),
-            MessagePassingLayerConfiguration(32, 4, 8, 32, True),
-            MessagePassingLayerConfiguration(32, 4, 8, 32, True)
-        ]
-        configuration.all_node_aggregation = MultiHeadAggregationConfiguration(8, 2, True)
-        configuration.join_node_aggregation = MultiHeadAggregationConfiguration(8, 4, True)
-        configuration.join_edge_aggregation = MultiHeadAggregationConfiguration(8, 2, True)
-        configuration.join_layer_sizes = [64, 32]
-        configuration.subquery_layer_sizes = [32, 16]
-        configuration.scan_layer_sizes = [32, 16]
-        return configuration
-
-
-    @staticmethod
-    def jgmp_sized_neural_network_configuration(schema: Schema) -> TopDownLearnedOptimizerConfiguration:
-        configuration = TopDownLearnedOptimizerConfiguration.default_configuration(schema)
-        configuration.name = "JGMP-Sized Neural Network"
-        configuration.description = "JGMP-sized neural network configuration"
-        configuration.table_specific_hidden_size = 32
-        configuration.node_layer_sizes = [64]
-        configuration.edge_layer_sizes = [8]
-        configuration.message_passing_layer_configurations = [
-            MessagePassingLayerConfiguration(32, 4, 8, 32, True),
-            MessagePassingLayerConfiguration(32, 4, 8, 32, True),
-            MessagePassingLayerConfiguration(32, 4, 8, 32, True)
-        ]
-        configuration.all_node_aggregation = MultiHeadAggregationConfiguration(128, 4, True)
-        configuration.join_node_aggregation = MultiHeadAggregationConfiguration(128, 4, True)
-        configuration.join_edge_aggregation = MultiHeadAggregationConfiguration(8, 2, True)
-        configuration.join_layer_sizes = [256]
-        configuration.subquery_layer_sizes = [256]
-        configuration.scan_layer_sizes = [64]
-        return configuration
-
-    @staticmethod
-    def jgmp_sized_neural_network_no_cardinality_deduction_configuration(schema: Schema) -> TopDownLearnedOptimizerConfiguration:
-        configuration = TopDownLearnedOptimizerConfiguration.jgmp_sized_neural_network_configuration(schema)
         configuration.deduce_cardinality_ranges = False
         return configuration
 
     @staticmethod
-    def jgmp_sized_neural_network_no_decomposed_costs_configuration(schema: Schema) -> TopDownLearnedOptimizerConfiguration:
-        configuration = TopDownLearnedOptimizerConfiguration.jgmp_sized_neural_network_configuration(schema)
+    def no_decomposed_costs_configuration(schema: Schema) -> TopDownLearnedOptimizerConfiguration:
+        configuration = TopDownLearnedOptimizerConfiguration.default_configuration(schema)
         configuration.learn_decomposed_costs = False
         configuration.learning_rate = configuration.learning_rate / 100  # Necessary to stabilize training without decomposed costs, otherwise we see divergence in training
         return configuration
 
     @staticmethod
-    def reduced_jgmp_sized_neural_network_configuration(schema: Schema) -> TopDownLearnedOptimizerConfiguration:
+    def corrected_targets_configuration(schema: Schema) -> TopDownLearnedOptimizerConfiguration:
         configuration = TopDownLearnedOptimizerConfiguration.default_configuration(schema)
-        configuration.name = "JGMP-Sized Neural Network"
-        configuration.description = "JGMP-sized neural network configuration"
-        configuration.table_specific_hidden_size = 32
-        configuration.node_layer_sizes = [64]
-        configuration.edge_layer_sizes = [8]
-        configuration.message_passing_layer_configurations = [
-            MessagePassingLayerConfiguration(32, 4, 8, 32, True),
-            MessagePassingLayerConfiguration(32, 4, 8, 32, True),
-            MessagePassingLayerConfiguration(32, 4, 8, 32, True)
-        ]
-        configuration.all_node_aggregation = MultiHeadAggregationConfiguration(64, 4, True)
-        configuration.join_node_aggregation = MultiHeadAggregationConfiguration(64, 4, True)
-        configuration.join_edge_aggregation = MultiHeadAggregationConfiguration(8, 2, True)
-        configuration.join_layer_sizes = [128]
-        configuration.subquery_layer_sizes = [128]
-        configuration.scan_layer_sizes = [64]
+        configuration.correct_target_violations = True
         return configuration
-
-
-
-
-

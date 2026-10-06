@@ -1,7 +1,12 @@
-from typing import Dict, Optional, Tuple
+import json
+from typing import Dict, List, Optional, Tuple
+
+import psycopg2
 
 from cardinality_estimators.cardinality_estimator import CardinalityEstimator, CardinalityMode
 from cardinality_estimators.cardinality_range import CardinalityRange
+from cardinality_estimators.postgresql_cardinality_estimator import PostgreSQLCardinalityEstimator
+from queries.benchmark_query import BenchmarkQuery
 from queries.predicates.true_predicate import TruePredicate
 from queries.query import Query
 from queries.spj_query import SPJQuery
@@ -9,10 +14,14 @@ from schemas.schema import Schema
 
 
 class PropheticCardinalityEstimator(CardinalityEstimator):
-    def __init__(self, gather_on_demand_schema: Optional[Schema] = None, raise_inconsistent_merges: bool = False):
+    def __init__(self, gather_on_demand_schema: Optional[Schema] = None, raise_inconsistent_merges: bool = False, gather_on_demand_timeout_seconds: Optional[float] = None):
         self.memory: Dict[Query, CardinalityRange] = {}
         self.gather_on_demand_schema = gather_on_demand_schema
         self.raise_inconsistent_merges = raise_inconsistent_merges
+        self.gather_on_demand_timeout_seconds = gather_on_demand_timeout_seconds
+        self._gather_connection = None
+        self._gather_connection_timeout_seconds = None
+        self._fallback_cardinality_estimator: Optional[PostgreSQLCardinalityEstimator] = None
 
     def estimate(self, query: Query, cardinality_mode: CardinalityMode = CardinalityMode.MEAN) -> Optional[float]:
         max_cardinality = None
@@ -28,12 +37,12 @@ class PropheticCardinalityEstimator(CardinalityEstimator):
         cardinality_range = self.memory.get(query)
         if cardinality_range is None:
             if self.gather_on_demand_schema is not None and isinstance(query, SPJQuery):
-                cursor = self.gather_on_demand_schema.connection().cursor()
-                cardinality_query = query.get_query_text("COUNT(*)")
-                cursor.execute(cardinality_query)
-                result = cursor.fetchone()
-                cursor.close()
-                cardinality = result[0]
+                cardinality = self._gather_cardinality(query)
+                if cardinality is None:
+                    # The fetch timed out: memorize a PostgreSQL estimate so the count is not attempted again.
+                    if self._fallback_cardinality_estimator is None:
+                        self._fallback_cardinality_estimator = PostgreSQLCardinalityEstimator(self.gather_on_demand_schema, False)
+                    cardinality = self._fallback_cardinality_estimator.estimate(query)
                 self.memorize(query, CardinalityRange(cardinality, cardinality))
                 return float(cardinality)
             if cardinality_mode == CardinalityMode.MIN:
@@ -48,6 +57,45 @@ class PropheticCardinalityEstimator(CardinalityEstimator):
         if cardinality_range.max_cardinality is not None:
             return (self.memory[query].min_cardinality + self.memory[query].max_cardinality) / 2
         return None
+
+    def _gather_cardinality(self, query: SPJQuery) -> Optional[float]:
+        """Fetches the true cardinality, returning None if the configured timeout is exceeded."""
+        if self._gather_connection is None:
+            self._gather_connection = self.gather_on_demand_schema.connection()
+            # Autocommit keeps statement_timeout session-scoped: a rollback would revert a transaction-scoped SET.
+            self._gather_connection.autocommit = True
+        if self._gather_connection_timeout_seconds != self.gather_on_demand_timeout_seconds:
+            self._gather_connection_timeout_seconds = self.gather_on_demand_timeout_seconds
+            timeout_milliseconds = 0 if self.gather_on_demand_timeout_seconds is None else int(self.gather_on_demand_timeout_seconds * 1000)
+            with self._gather_connection.cursor() as cursor:
+                cursor.execute("SET statement_timeout = %d;" % timeout_milliseconds)
+        try:
+            with self._gather_connection.cursor() as cursor:
+                cursor.execute(query.get_query_text("COUNT(*)"))
+                return cursor.fetchone()[0]
+        except psycopg2.errors.QueryCanceled:
+            self._gather_connection.rollback()
+            return None
+
+    def load_cardinalities(self, path: str, benchmark_queries: List[BenchmarkQuery]):
+        """Loads subquery cardinalities exported by export_true_cardinalities.py, keyed by
+        benchmark query id and identified by the table occurrence aliases of the parsed queries."""
+        with open(path) as f:
+            data = json.load(f)
+        benchmark_query_dict = {}
+        for benchmark_query in benchmark_queries:
+            benchmark_query_dict[str(benchmark_query.query_id)] = benchmark_query
+        for query_id, entries in data["queries"].items():
+            benchmark_query = benchmark_query_dict.get(query_id)
+            if benchmark_query is None or benchmark_query.query is None:
+                continue
+            query = benchmark_query.query
+            assert isinstance(query, SPJQuery)
+            alias_dict = {table_occurrence.alias(): table_occurrence for table_occurrence in query.table_occurrences()}
+            for entry in entries:
+                table_occurrences = [alias_dict[alias] for alias in entry["aliases"]]
+                subquery = query.induced_subquery(table_occurrences)
+                self.memorize(subquery, CardinalityRange(entry["cardinality"], entry["cardinality"]))
 
     def estimate_range(self, query: Query) -> CardinalityRange:
         return self.memory.get(query, CardinalityRange(0, None))

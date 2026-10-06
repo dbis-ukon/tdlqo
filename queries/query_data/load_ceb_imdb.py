@@ -49,6 +49,6 @@ def load_ceb_imdb(schema_id: int, path: str, query_db: QueryDB, benchmark_name: 
 
 
 # Example usage
-load_ceb_imdb(1, "/home/silvan/Downloads/imdb_pg_dataset-master/ceb-imdb-13k", QueryDB("query_db", 5443), "CEB-IMDb")
-load_ceb_imdb(1, "/home/silvan/Downloads/imdb_pg_dataset-master/ceb-imdb-3k", QueryDB("query_db", 5443), "CEB-IMDb-unique")
+# load_ceb_imdb(1, "/home/silvan/Downloads/imdb_pg_dataset-master/ceb-imdb-13k", QueryDB("query_db", 5443), "CEB-IMDb")
+# load_ceb_imdb(1, "/home/silvan/Downloads/imdb_pg_dataset-master/ceb-imdb-3k", QueryDB("query_db", 5443), "CEB-IMDb-unique")
 

@@ -87,6 +87,37 @@ class TopDownLearnedOptimizerModule(torch.nn.Module):
         self._log_min_local_cost = torch.log(torch.tensor(configuration.min_local_cost))
         self._softplus = torch.nn.Softplus()
 
+    def adapt_join_information_size(self, join_information_size: int, optimizer: Optional[torch.optim.Optimizer] = None) -> bool:
+        """Grow the first edge layer to a larger join information size by adding zero weights for key columns added on demand."""
+        assert len(self._edge_layers) > 0 and isinstance(self._edge_layers[0], torch.nn.Linear)
+        layer = self._edge_layers[0]
+        old_size = layer.in_features
+        if old_size == join_information_size:
+            return False
+        assert join_information_size > old_size
+        # The input is cat([first_column_encoding, second_column_encoding]), so zero columns are appended to both halves.
+        old_half = old_size // 2
+
+        def pad_columns(matrix: torch.Tensor) -> torch.Tensor:
+            padding = torch.zeros((matrix.size(0), (join_information_size - old_size) // 2), dtype=matrix.dtype, device=matrix.device)
+            return torch.cat([matrix[:, :old_half], padding, matrix[:, old_half:], padding], dim=1)
+
+        # A new Parameter is required: resizing .data in place leaves a stale gradient accumulator behind.
+        old_weight = layer.weight
+        new_weight = torch.nn.Parameter(pad_columns(old_weight.data))
+        if optimizer is not None:
+            for param_group in optimizer.param_groups:
+                param_group["params"] = [new_weight if param is old_weight else param for param in param_group["params"]]
+            state = optimizer.state.pop(old_weight, None)
+            if state is not None:
+                for key in ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"]:
+                    if key in state and torch.is_tensor(state[key]) and state[key].dim() == 2:
+                        state[key] = pad_columns(state[key])
+                optimizer.state[new_weight] = state
+        layer.weight = new_weight
+        layer.in_features = join_information_size
+        return True
+
     def _log_forward(self, data: TopDownLearnedOptimizerData) -> Tuple[torch.FloatTensor, torch.FloatTensor, Optional[torch.FloatTensor]]:
         nodes = data.x
         if self._table_specific_weights is not None:
@@ -181,6 +212,11 @@ class TopDownLearnedOptimizerModule(torch.nn.Module):
         join_predictions = torch.exp(log_join_predictions)
         scan_predictions = torch.exp(log_scan_predictions)
         return join_predictions, scan_predictions
+
+    def local_forward(self, data: TopDownLearnedOptimizerData) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        """Per-operator local cost predictions without the decomposed subgroup cost terms that log_forward adds."""
+        log_join_predictions, log_scan_predictions, _ = self._log_forward(data)
+        return torch.exp(log_join_predictions), torch.exp(log_scan_predictions)
 
     def loss(self, data: TopDownLearnedOptimizerData, target_data: TopDownLearnedOptimizerTargetData) -> Tuple[torch.FloatTensor, np.ndarray, np.ndarray]:
         log_join_predictions, log_scan_predictions, log_subgroup_predictions = self._log_forward(data)

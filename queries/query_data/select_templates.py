@@ -65,9 +65,9 @@ def select_templates(schema: Schema, query_db: QueryDB, benchmark_id: int, num_q
     query_db.commit()
 
 
-schema = stack_schema(port=5443)
-query_db = QueryDB("query_db", 5443)
-benchmark_id = 17
-num_queries = 500
-select_templates(schema, query_db, benchmark_id, num_queries, True)
+# schema = stack_schema(port=5443)
+# query_db = QueryDB("query_db", 5443)
+# benchmark_id = 17
+# num_queries = 500
+# select_templates(schema, query_db, benchmark_id, num_queries, True)
 

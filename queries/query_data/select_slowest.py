@@ -78,9 +78,9 @@ def select_slowest(schema: Schema, query_db: QueryDB, benchmark_id: int, num_que
     query_db.commit()
 
 
-schema = stack_schema(port=5443)
-query_db = QueryDB("query_db", 5443)
-benchmark_id = 17
-num_queries = 500
-select_slowest(schema, query_db, benchmark_id, num_queries, True, min_execution_time=1000)
+# schema = stack_schema(port=5443)
+# query_db = QueryDB("query_db", 5443)
+# benchmark_id = 17
+# num_queries = 500
+# select_slowest(schema, query_db, benchmark_id, num_queries, True, min_execution_time=1000)
 

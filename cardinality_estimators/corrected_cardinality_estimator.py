@@ -1,4 +1,3 @@
-from abc import abstractmethod
 from typing import Optional
 
 from cardinality_estimators.cardinality_estimator import CardinalityEstimator, CardinalityMode
@@ -6,7 +5,7 @@ from cardinality_estimators.prophetic_cardinality_estimator import PropheticCard
 from queries.query import Query
 
 
-class CorrectedCardinalityEstimator:
+class CorrectedCardinalityEstimator(CardinalityEstimator):
     def __init__(self, primary_estimator: CardinalityEstimator, correction_estimator: PropheticCardinalityEstimator):
         self._primary_estimator = primary_estimator
         self._correction_estimator = correction_estimator

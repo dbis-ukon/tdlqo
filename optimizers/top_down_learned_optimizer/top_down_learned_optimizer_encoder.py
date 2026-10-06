@@ -1,4 +1,6 @@
+import json
 import math
+import os
 from typing import List, TypeVar, Dict, Iterable, Tuple, Set, Optional, FrozenSet
 
 import numpy as np
@@ -28,6 +30,7 @@ from queries.table_occurrence import TableOccurrence
 from relational_algebra_expressions.join_expressions.join_expression import JoinExpression
 from relational_algebra_expressions.relational_algebra_expression import RelationalAlgebraExpression
 from relational_algebra_expressions.scan_expressions.scan_expression import ScanExpression
+from schemas.column import Column
 from schemas.schema import Schema
 from optimizers.top_down_learned_optimizer.top_down_learned_optimizer_data.top_down_learned_optimizer_target_data import TopDownLearnedOptimizerTargetData, PlanType
 
@@ -50,7 +53,9 @@ class TopDownLearnedOptimizerEncoder:
         key_columns = list(key_columns)
         key_columns.sort(key=lambda x: (x[0].name(), x[1].name()))
         key_columns = [column for table, column in key_columns]
-        self._key_column_encodings, _ = self._build_one_hot_encodings(key_columns)
+        # Non-foreign-key join columns are registered on demand in _key_column_index, growing the one-hot encoding.
+        self._key_column_indexes = {column: i for i, column in enumerate(key_columns)}
+        self._last_num_key_columns = len(self._key_column_indexes)
         self._table_occurrence_encoding_cardinality_estimator = configuration.table_occurrence_encoding_cardinality_estimator
         self._table_occurrence_encoding_predicate_columns = configuration.table_occurrence_encoding_predicate_columns
         self._table_occurrence_encoding_predicate_costs = configuration.table_occurrence_encoding_predicate_costs and isinstance(configuration.cost_model, PostgreSQLCostModel)
@@ -67,8 +72,8 @@ class TopDownLearnedOptimizerEncoder:
             self._feature_selected_sample_encoder = None
         current_column_index = 0
         self._column_index_dict = {}
-        for table in schema.tables():
-            for column in table.columns():
+        for table in sorted(schema.tables(), key=lambda t: t.name()):
+            for column in sorted(table.columns(), key=lambda c: c.name()):
                 self._column_index_dict[column] = current_column_index
                 current_column_index += 1
         join_operators = set()
@@ -91,9 +96,11 @@ class TopDownLearnedOptimizerEncoder:
                 scan_operators.add(operator)
             else:
                 raise ValueError("Unknown operator type")
-        self._join_operator_encodings, _ = self._build_one_hot_encodings(join_operators)
-        self._scan_operator_encodings, _ = self._build_one_hot_encodings(scan_operators)
-        self._requirement_encodings, _ = self._build_one_hot_encodings(requirements)
+        # Sorted by their string form: the elements are operator classes, (class, bool, bool) tuples
+        # and requirement values, which have no common ordering but a stable textual one.
+        self._join_operator_encodings, _ = self._build_one_hot_encodings(sorted(join_operators, key=str))
+        self._scan_operator_encodings, _ = self._build_one_hot_encodings(sorted(scan_operators, key=str))
+        self._requirement_encodings, _ = self._build_one_hot_encodings(sorted(requirements, key=str))
         self._learn_decomposed_costs = configuration.learn_decomposed_costs
         self._recursive_cost_constraint = configuration.recursive_cost_constraint_factor is not None
         self._last_training_queries = set()
@@ -124,7 +131,22 @@ class TopDownLearnedOptimizerEncoder:
         return size
 
     def join_information_size(self) -> int:
-        return len(self._key_column_encodings) * 2
+        return len(self._key_column_indexes) * 2
+
+    def _key_column_index(self, column: Column) -> int:
+        index = self._key_column_indexes.get(column)
+        if index is None:
+            index = len(self._key_column_indexes)
+            self._key_column_indexes[column] = index
+        return index
+
+    def _key_column_encoding(self, column: Column, cache: Dict[Column, torch.FloatTensor]) -> torch.FloatTensor:
+        encoding = cache.get(column)
+        if encoding is None:
+            encoding = torch.zeros(len(self._key_column_indexes))
+            encoding[self._key_column_indexes[column]] = 1
+            cache[column] = encoding
+        return encoding
 
     def join_operator_information_size(self) -> int:
         return len(self._join_operator_encodings)
@@ -144,7 +166,10 @@ class TopDownLearnedOptimizerEncoder:
     T = TypeVar('T')
     @staticmethod
     def _build_one_hot_encodings(objects: Iterable[T]) -> Tuple[Dict[T, torch.FloatTensor], Dict[T, int]]:
-        objects = list(set(objects))
+        # dict.fromkeys removes duplicates while keeping the caller's order. A set would order by
+        # identity hash instead, which differs between processes, so a module saved in one process
+        # would read its table and operator one-hots in a different order in the next one.
+        objects = list(dict.fromkeys(objects))
         encoding_dict = {}
         index_dict = {}
         for i, obj in enumerate(objects):
@@ -177,15 +202,20 @@ class TopDownLearnedOptimizerEncoder:
 
         join_pair_dict = {i: {} for i in range(len(all_table_occurrences))}
         join_dict = {table_occurrence: set() for table_occurrence in all_table_occurrences}
+        # Register all join columns first so that all encodings in this call share the current size.
+        for join in query.joins():
+            for _, column in join.equivalence_class():
+                self._key_column_index(column)
+        key_column_encodings = {}
         for join in query.joins():
             equivalence_class = list(join.equivalence_class())
             for i, (first_table_occurrence, first_column) in enumerate(equivalence_class):
-                first_column_encoding = self._key_column_encodings[first_column]
+                first_column_encoding = self._key_column_encoding(first_column, key_column_encodings)
                 first_table_occurrence_index = table_occurrence_index_dict[first_table_occurrence]
                 for j, (second_table_occurrence, second_column) in enumerate(equivalence_class):
                     if i == j:
                         continue
-                    second_column_encoding = self._key_column_encodings[second_column]
+                    second_column_encoding = self._key_column_encoding(second_column, key_column_encodings)
                     second_table_occurrence_index = table_occurrence_index_dict[second_table_occurrence]
 
                     join_pair = (first_column, first_column_encoding,
@@ -558,21 +588,102 @@ class TopDownLearnedOptimizerEncoder:
             changed = self._feature_selected_sample_encoder.update_feature_selected_sample_encoder(training_queries)
             any_changes = any_changes or changed
         self._last_training_queries = training_queries.copy()
+        # Register the join columns of the training queries, so that a grown key column vocabulary counts as an encoder change.
+        for query in training_queries:
+            for join in query.joins():
+                for _, column in join.equivalence_class():
+                    self._key_column_index(column)
+        if len(self._key_column_indexes) != self._last_num_key_columns:
+            self._last_num_key_columns = len(self._key_column_indexes)
+            any_changes = True
         if any_changes:
             self.version += 1
         return any_changes
+
+    def _column_name_dicts(self) -> Tuple[Dict[Column, Tuple[str, str]], Dict[Tuple[str, str], Column]]:
+        column_names = {}
+        column_dict = {}
+        for table, columns in self._column_orders.items():
+            for column in columns:
+                column_names[column] = (table.name(), column.name())
+                column_dict[(table.name(), column.name())] = column
+        return column_names, column_dict
+
+    def _ordered_encoding_names(self, encodings: Dict[T, torch.FloatTensor]) -> List[str]:
+        # The position of the one is the index the module was trained with, stored by name.
+        names: List[Optional[str]] = [None] * len(encodings)
+        for encoded_object, encoding in encodings.items():
+            names[int(torch.argmax(encoding))] = str(encoded_object)
+        return names
+
+    def _encoding_order(self) -> Dict[str, List[str]]:
+        table_names: List[Optional[str]] = [None] * len(self._table_index)
+        for table, index in self._table_index.items():
+            table_names[index] = table.name()
+        return {"tables": table_names,
+                "join_operators": self._ordered_encoding_names(self._join_operator_encodings),
+                "scan_operators": self._ordered_encoding_names(self._scan_operator_encodings),
+                "requirements": self._ordered_encoding_names(self._requirement_encodings)}
+
+    def _apply_encoding_order(self, encoding_order: Dict[str, List[str]]):
+        """Restores the one-hot index assignment the module was trained with, so that its weights
+        keep referring to the tables and operators they were trained on."""
+        tables_by_name = {table.name(): table for table in self._table_index}
+        if sorted(encoding_order["tables"]) != sorted(tables_by_name):
+            raise ValueError("The stored tables %s do not match the schema tables %s"
+                             % (sorted(encoding_order["tables"]), sorted(tables_by_name)))
+        self._table_encodings, self._table_index = self._build_one_hot_encodings(
+            [tables_by_name[table_name] for table_name in encoding_order["tables"]])
+        self._join_operator_encodings, _ = self._build_one_hot_encodings(
+            self._objects_in_stored_order(self._join_operator_encodings, encoding_order["join_operators"], "join operators"))
+        self._scan_operator_encodings, _ = self._build_one_hot_encodings(
+            self._objects_in_stored_order(self._scan_operator_encodings, encoding_order["scan_operators"], "scan operators"))
+        self._requirement_encodings, _ = self._build_one_hot_encodings(
+            self._objects_in_stored_order(self._requirement_encodings, encoding_order["requirements"], "requirements"))
+
+    @staticmethod
+    def _objects_in_stored_order(encodings: Dict[T, torch.FloatTensor], names: List[str], description: str) -> List[T]:
+        objects_by_name = {str(encoded_object): encoded_object for encoded_object in encodings}
+        if sorted(objects_by_name) != sorted(names):
+            raise ValueError("The stored %s %s do not match the configured %s %s"
+                             % (description, sorted(names), description, sorted(objects_by_name)))
+        return [objects_by_name[name] for name in names]
 
     def save(self, path: str):
         if self._random_sample_encoder is not None:
             self._random_sample_encoder.save(path + "_random_sample_encoder.json")
         if self._feature_selected_sample_encoder is not None:
             self._feature_selected_sample_encoder.save(path + "_feature_selected_sample_encoder.json")
+        column_names, _ = self._column_name_dicts()
+        key_column_names = [None] * len(self._key_column_indexes)
+        for column, index in self._key_column_indexes.items():
+            key_column_names[index] = column_names[column]
+        with open(path + "_key_columns.json", "w") as f:
+            json.dump(key_column_names, f)
+        with open(path + "_encoding_order.json", "w") as f:
+            json.dump(self._encoding_order(), f)
 
     def load(self, path: str):
         if self._random_sample_encoder is not None:
             self._random_sample_encoder.load(path + "_random_sample_encoder.json")
         if self._feature_selected_sample_encoder is not None:
             self._feature_selected_sample_encoder.load(path + "_feature_selected_sample_encoder.json")
+        encoding_order_path = path + "_encoding_order.json"
+        if not os.path.exists(encoding_order_path):
+            raise ValueError(
+                "%s is missing. This checkpoint was written before the one-hot encoding order was persisted, and the "
+                "order it was trained with cannot be reconstructed: it followed the identity hashes of that process. "
+                "Loading it would feed the module permuted table and operator features, so it has to be retrained."
+                % encoding_order_path)
+        with open(encoding_order_path) as f:
+            self._apply_encoding_order(json.load(f))
+        key_columns_path = path + "_key_columns.json"
+        if os.path.exists(key_columns_path):
+            with open(key_columns_path) as f:
+                key_column_names = json.load(f)
+            _, column_dict = self._column_name_dicts()
+            self._key_column_indexes = {column_dict[(table_name, column_name)]: i for i, (table_name, column_name) in enumerate(key_column_names)}
+            self._last_num_key_columns = len(self._key_column_indexes)
 
 
 

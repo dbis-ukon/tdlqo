@@ -14,6 +14,7 @@ from queries.predicates.literals.tuple_literal import TupleLiteral
 from queries.predicates.negation import Negation
 from queries.table_occurrence import TableOccurrence
 from queries.benchmark_query import BenchmarkQuery
+from queries.predicates.comparison_predicate import ComparisonPredicate
 from queries.predicates.comparison_operator import COMPARISON_OPERATOR_EQ, COMPARISON_OPERATOR_GT, \
     COMPARISON_OPERATOR_LT, COMPARISON_OPERATOR_LIKE, COMPARISON_OPERATOR_ILIKE, COMPARISON_OPERATOR_GTE, \
     COMPARISON_OPERATOR_LTE, COMPARISON_OPERATOR_IS, COMPARISON_OPERATOR_NEQ, COMPARISON_OPERATOR_IN, \
@@ -192,7 +193,7 @@ def _build_pg_explain_query(schema: Schema, pg_explain: dict) -> Optional[Tuple[
                 else:
                     atomic_join_conditions = [new_join_condition]
                 for atomic_join_condition in atomic_join_conditions:
-                    left_table_alias, left_column_name, right_table_alias, right_column_name = re.match(r"\((.*)\.(.*) = (.*)\.(.*)\)", atomic_join_condition).groups()
+                    left_table_alias, left_column_name, right_table_alias, right_column_name = _parse_equi_join_condition(atomic_join_condition)
                     left_table_occurrence = alias_dict[left_table_alias]
                     left_column = left_table_occurrence.table().column(left_column_name)
                     right_table_occurrence = alias_dict[right_table_alias]
@@ -259,11 +260,16 @@ def _build_scan_query(schema: Schema, pg_explain: dict) -> Optional[Tuple[SPJQue
     if index_condition is None:
         pushed_down_predicates = []
     else:
-        join_alias, join_column, join_other_alias, join_other_column = re.match(r"\((.*)\.(.*) = (.*)\.(.*)\)", index_condition).groups()
+        join_alias, join_column, join_other_alias, join_other_column = _parse_equi_join_condition(index_condition)
         aliased_condition = f"({join_alias}.{join_column} = {join_other_alias}.{join_other_column})"
         pushed_down_predicates = [aliased_condition]
     spj_query = SPJQuery([table_occurrence], [], [])
     return spj_query, pushed_down_predicates, equality_dict
+
+
+def _parse_equi_join_condition(condition: str) -> Tuple[str, str, str, str]:
+    condition = re.sub(r"\((\w+\.\w+)\)::\w+(?: \w+)*(?:\(\d+(?:,\d+)?\))?", r"\1", condition)
+    return re.match(r"\((.*)\.(.*) = (.*)\.(.*)\)", condition).groups()
 
 
 def _duplicate_predicates_across_joins(table_occurrences: Iterable[TableOccurrence], joins: Iterable[Join]) -> None:
@@ -378,6 +384,13 @@ def _sqlglot_parse(table_occurrence: TableOccurrence, sqlglot_expression: sqlglo
         expression = sqlglot_expression.args["expression"]
         this_is_column = _is_column_expression(this)
         expression_is_column = _is_column_expression(expression)
+        if this_is_column and expression_is_column:
+            comparison_operator = _sqlglot_comparison_operator_map[sqlglot_expression.key]
+            left_column, left_cast_data_type = _sqlglot_parse_column(table_occurrence.table(), this)
+            right_column, right_cast_data_type = _sqlglot_parse_column(table_occurrence.table(), expression)
+            return ComparisonPredicate(table_occurrence, left_column, comparison_operator, right_column,
+                                       left_column_cast_data_type=left_cast_data_type,
+                                       right_column_cast_data_type=right_cast_data_type)
         if expression_is_column and not this_is_column:
             left = expression
             right = this

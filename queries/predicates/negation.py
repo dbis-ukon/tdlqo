@@ -2,6 +2,7 @@ from typing import FrozenSet, Optional, Dict
 
 import queries.predicates.conjunction
 import queries.predicates.disjunction
+from queries.predicates.comparison_predicate import ComparisonPredicate
 from queries.predicates.predicate import Predicate
 from queries.predicates.simple_predicate import SimplePredicate
 from queries.table_occurrence import TableOccurrence
@@ -25,7 +26,7 @@ class Negation(Predicate):
         return isinstance(other, Negation) and self._predicate.syntactically_equal(other.predicate(), table_occurrence_mapping)
 
     def _check_normal_form(self) -> bool:
-        return isinstance(self._predicate, SimplePredicate)
+        return isinstance(self._predicate, (SimplePredicate, ComparisonPredicate))
 
     def _get_normal_form(self) -> Optional[Predicate]:
         if isinstance(self._predicate, Negation):

@@ -1,5 +1,5 @@
 from itertools import cycle, islice
-from typing import List, Callable
+from typing import List, Callable, Optional
 import json
 import logging
 import time
@@ -20,12 +20,17 @@ class OnlineTrainingExperiment(Experiment):
                  execution_engine: ExecutionEngine,
                  iterations: int,
                  training_queries: List[BenchmarkQuery],
-                 k: int,
+                 k: Optional[int],
                  repetitions: int,
                  always_test: bool,
                  test_sets: List[List[BenchmarkQuery]],
                  queries_per_iteration: int = 100,
-                 debug_mode: bool = False):
+                 debug_mode: bool = False,
+                 test_queries: Optional[List[BenchmarkQuery]] = None,
+                 final_training_pass: bool = True):
+        # test_queries: fixed test set. Each repetition then trains on all training_queries and tests on test_queries
+        # instead of using k-fold cross validation.
+        # final_training_pass: execute the training set once more after the last training iteration, before the final test.
         super().__init__("Online Training Experiment", "")
         self.optimizer_generator = optimizer_generator
         self.execution_engine = execution_engine
@@ -36,6 +41,8 @@ class OnlineTrainingExperiment(Experiment):
         self.always_test = always_test
         self.test_sets = test_sets
         self.queries_per_iteration = queries_per_iteration
+        self.test_queries = test_queries
+        self.final_training_pass = final_training_pass
 
         if debug_mode:
             debug_logger = logging.getLogger("Optimizer Debug %s" % self.start_time.strftime("%Y%m%d_%H%M%S"))
@@ -47,8 +54,11 @@ class OnlineTrainingExperiment(Experiment):
             self._debug_logger = debug_logger
 
     def run(self):
-        cross_validation_splits = self._cross_validation_splits(self.training_queries, self.k, self.repetitions)
-        for i, (training_queries, test_queries) in enumerate(cross_validation_splits):
+        if self.test_queries is not None:
+            splits = [(self.training_queries, self.test_queries)] * self.repetitions
+        else:
+            splits = self._cross_validation_splits(self.training_queries, self.k, self.repetitions)
+        for i, (training_queries, test_queries) in enumerate(splits):
             optimizer = self.optimizer_generator(training_queries + test_queries, training_queries)
             optimizer_start_time = time.time()
             optimizer.print_parameters(self._logger)
@@ -77,7 +87,10 @@ class OnlineTrainingExperiment(Experiment):
                     self._iteration_test(iteration, optimizer, test_queries)
                 test_end_time = time.time()
                 optimizer_start_time = optimizer_start_time + (test_end_time - test_start_time)
-            self._iteration_train_and_test(self.iterations, optimizer, training_queries, test_queries)
+            if self.final_training_pass:
+                self._iteration_train_and_test(self.iterations, optimizer, training_queries, test_queries)
+            else:
+                self._iteration_test(self.iterations, optimizer, test_queries)
 
             for j, test_queries in enumerate(self.test_sets):
                 test_path = self.result_path() + "/test_set_%d.csv" % j

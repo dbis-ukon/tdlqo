@@ -16,6 +16,9 @@ class Optimizer:
         self.name: str = name
         self.description: str = description
         self.optimizer_id: Optional[str] = optimizer_id
+        # SET commands the execution engine applies when optimize() returns None and the
+        # default PostgreSQL plan is executed instead.
+        self.default_plan_set_commands: List[str] = []
 
     @abstractmethod
     def optimize(self, query: Query, explore: bool = False, benchmark_query: Optional[BenchmarkQuery] = None, debug_logger: Optional[logging.Logger] = None) -> Optional[RelationalAlgebraExpression]:

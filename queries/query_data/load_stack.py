@@ -52,5 +52,5 @@ def load_stack(schema_id: int, path: str, query_db: QueryDB):
 
 
 
-load_stack(3, "/home/silvan/Downloads/stack", QueryDB("query_db", 5443))
+# load_stack(3, "/home/silvan/Downloads/stack", QueryDB("query_db", 5443))
 

@@ -18,8 +18,10 @@ import gc
 
 from cardinality_estimators.cardinality_estimator import CardinalityMode
 from cardinality_estimators.cardinality_range import CardinalityRange
+from cardinality_estimators.corrected_cardinality_estimator import CorrectedCardinalityEstimator
 from cardinality_estimators.postgresql_cardinality_estimator import PostgreSQLCardinalityEstimator
 from cardinality_estimators.prophetic_cardinality_estimator import PropheticCardinalityEstimator
+from cost_models.local_cost_model import LocalCostModel
 from execution_engines.execution_data import ExecutionData
 from execution_engines.pg_hint_plan_execution_engine import PgHintPlanExecutionEngine
 from execution_engines.postgresql_execution_engine import PostgreSQLExecutionEngine
@@ -49,7 +51,9 @@ from relational_algebra_expressions.group_relational_algebra_expression import G
 from relational_algebra_expressions.relational_algebra_expression import RelationalAlgebraExpression
 from relational_algebra_expressions.requirements import Requirements
 from relational_algebra_expressions.scan_expressions.index_scan_expression import IndexScanExpression
+from schemas.column import Column
 from schemas.schema import Schema
+from schemas.table import Table
 import concurrent.futures
 
 class TopDownLearnedOptimizer(TopDownOptimizer):
@@ -76,6 +80,7 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
 
         self._learn_decomposed_costs = configuration.learn_decomposed_costs
         self._min_local_cost = configuration.min_local_cost
+        self._correct_target_violations = configuration.correct_target_violations
 
         self._canonical_queries: Dict[SPJQuery, SPJQuery] = {}
         self._training_table_occurrence_encodings = {}
@@ -102,6 +107,8 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
         cardinality_estimator = self.cost_model.cardinality_estimator
         assert isinstance(cardinality_estimator, PropheticCardinalityEstimator)
         self._cardinality_estimator: PropheticCardinalityEstimator = cardinality_estimator
+        # Reference cost model of the true cardinality check, set by set_true_cardinality_cost_model.
+        self.true_cardinality_cost_model: Optional[LocalCostModel] = None
 
         self._probe_min_cardinality_threshold = configuration.probe_min_cardinality_threshold
         self._probe_max_min_ratio_threshold = configuration.probe_max_min_ratio_threshold
@@ -143,8 +150,29 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
         min_cost, best_plan = self._choose_base(group, memoized_expressions)
         return best_plan
 
+    def _adapt_modules_to_encoder(self) -> bool:
+        # Key columns are registered on demand during encoding, so the join information size can grow between encodings.
+        join_information_size = self._encoder.join_information_size()
+        if self._double_q_learning:
+            changed = self._module_a.adapt_join_information_size(join_information_size, self._optimizer_a)
+            changed = self._module_b.adapt_join_information_size(join_information_size, self._optimizer_b) or changed
+        else:
+            changed = self._module.adapt_join_information_size(join_information_size, self._optimizer)
+        if changed:
+            # Refresh any checkpoints so that a potential restore matches the grown module.
+            if self._double_q_learning:
+                if getattr(self, "_module_checkpoint_a", None) is not None:
+                    self._module_checkpoint_a = self._module_a.state_dict()
+                if getattr(self, "_module_checkpoint_b", None) is not None:
+                    self._module_checkpoint_b = self._module_b.state_dict()
+            else:
+                if getattr(self, "_module_checkpoint", None) is not None:
+                    self._module_checkpoint = self._module.state_dict()
+        return changed
+
     def _choose_base(self, group: GroupRelationalAlgebraExpression, memoized_expressions: List[RelationalAlgebraExpression]) -> Tuple[float, RelationalAlgebraExpression]:
         query_data, plan_dict, _ = self._encoder.encode(group, memoized_expressions, table_occurrence_encodings=self._table_occurrence_encodings)
+        self._adapt_modules_to_encoder()
         if self._double_q_learning:
             module = random.choice([self._module_a, self._module_b])
             module_name = "A" if module is self._module_a else "B"
@@ -195,6 +223,7 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
 
     def get_costs(self, group: GroupRelationalAlgebraExpression, memoized_expressions: List[RelationalAlgebraExpression]) -> Dict[RelationalAlgebraExpression, float]:
         query_data, plan_dict, _ = self._encoder.encode(group, memoized_expressions)
+        self._adapt_modules_to_encoder()
         if self._double_q_learning:
             module = random.choice([self._module_a, self._module_b])
         else:
@@ -248,6 +277,7 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
             self._probed_subplan_queries.add(subplan_query)
             cardinality_range = self._probe_subplan_lower_bound(subplan_query)
             if cardinality_range is not None:
+                self._subquery_origins[subplan_query] = execution_data.query
                 self._update_cardinality_ranges(subplan_query, cardinality_range)
 
     def _probe_subplan_lower_bound(self, query: SPJQuery) -> Optional[CardinalityRange]:
@@ -317,6 +347,9 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
             for subplan_query in execution_data.plan.subplan_queries():
                 if subplan_query not in self._memory_queries:
                     assert isinstance(subplan_query, SPJQuery)
+                    if not subplan_query.is_connected():
+                        continue
+                    self._subquery_origins[subplan_query] = original_query
                     self._new_cardinalities.add(subplan_query)
 
     def _deduce_zero_cardinalities(self, query: SPJQuery, subplan_query: SPJQuery):
@@ -966,11 +999,26 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
         self._module_to(self._inference_device)
         self.trained = True
 
-    def _compute_costs(self) -> Tuple[int, Dict[GroupRelationalAlgebraExpression, float], Dict[str, int]]:
+    def set_true_cardinality_cost_model(self, true_cardinality_estimator: PropheticCardinalityEstimator) -> None:
+        """Enables the true cardinality check in _compute_costs, which compares the cost interval of every
+        local cost against the cost under the true cardinalities. Cardinalities that true_cardinality_estimator
+        does not know (the cost model also asks for queries that are not subqueries of the benchmark queries)
+        fall back to this optimizer's own cardinality estimator."""
+        self.true_cardinality_cost_model = self.cost_model.replace_cardinality_estimator(CorrectedCardinalityEstimator(self._cardinality_estimator, true_cardinality_estimator))
+
+    def _compute_costs(self) -> Tuple[int, Dict[GroupRelationalAlgebraExpression, float], Dict[str, int], Dict[str, float]]:
         local_costs_computed = 0
         local_costs_with_non_zero_lower = 0
         local_costs_with_finite_upper = 0
         local_costs_with_non_zero_lower_and_finite_upper = 0
+        bound_flip_factors: List[float] = []
+        true_cardinality_violation_factors: List[float] = []
+        true_cardinality_violation_after_flip_factors: List[float] = []
+        true_cardinality_costs_computed = 0
+        true_cardinality_lower_only_violation_factors: List[float] = []
+        true_cardinality_lower_only_checked = 0
+        lower_bounds_corrected = 0
+        upper_bounds_corrected = 0
         sorted_memory_queries = sorted(self._memory.keys(), key=lambda group: len(group.query().table_occurrences()))
         exact_costs: Dict[GroupRelationalAlgebraExpression, float] = {}
         for group in sorted_memory_queries:
@@ -979,20 +1027,49 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
             min_exact_cost = None
             for memoized_expression_memory in group_memory.memoized_expression_memories:
                 max_local_cost = self.cost_model.local_cost(memoized_expression_memory.memoized_expression, cardinality_mode=CardinalityMode.MAX)
-                if max_local_cost is not None or self._training_query_selection_mode == TrainingQuerySelectionMode.FINITE_UPPER_OR_NON_ZERO_LOWER or TrainingQuerySelectionMode.FINITE_UPPER_OR_NON_ZERO_LOWER_OR_EXECUTED:
+                if max_local_cost is not None or self._training_query_selection_mode == TrainingQuerySelectionMode.FINITE_UPPER_OR_NON_ZERO_LOWER or self._training_query_selection_mode == TrainingQuerySelectionMode.FINITE_UPPER_OR_NON_ZERO_LOWER_OR_EXECUTED:
                     min_local_cost = self.cost_model.local_cost(memoized_expression_memory.memoized_expression, cardinality_mode=CardinalityMode.MIN)
                     has_non_zero_lower = min_local_cost is not None and min_local_cost > 0
                     has_finite_upper = max_local_cost is not None
                     if min_local_cost is None:
                         min_local_cost = 1e-10
+                    true_local_cost = None
+                    if self.true_cardinality_cost_model is not None:
+                        # Check whether the cost interval contains the cost under the true cardinalities.
+                        true_local_cost = self._true_cardinality_local_cost(memoized_expression_memory.memoized_expression)
+                    if true_local_cost is not None:
+                        if max_local_cost is not None:
+                            true_cardinality_costs_computed += 1
+                            violation_factor = self._bracket_violation_factor(min_local_cost, max_local_cost, true_local_cost)
+                            if violation_factor is not None:
+                                true_cardinality_violation_factors.append(violation_factor)
+                            # Same check for the interval the training target is built from (bounds flipped if necessary, see below).
+                            violation_factor = self._bracket_violation_factor(min(min_local_cost, max_local_cost), max(min_local_cost, max_local_cost), true_local_cost)
+                            if violation_factor is not None:
+                                true_cardinality_violation_after_flip_factors.append(violation_factor)
+                        else:
+                            # A target without an upper bound trains the model on its lower bound alone,
+                            # which is violated when the true cost lies below it.
+                            true_cardinality_lower_only_checked += 1
+                            if true_local_cost < min_local_cost:
+                                true_cardinality_lower_only_violation_factors.append(self._severity_factor(min_local_cost, true_local_cost))
                     # Admittedly a bit strange, but cost models are not necessarily monotonic w.r.t. cardinality estimates, so min cost can be higher than max cost.
                     if max_local_cost is not None and min_local_cost > max_local_cost:
-                        memoized_expression_memory.max_local_cost = min_local_cost
-                        memoized_expression_memory.min_local_cost = max_local_cost
+                        bound_flip_factors.append(self._severity_factor(min_local_cost, max_local_cost))
+                        target_min_local_cost, target_max_local_cost = max_local_cost, min_local_cost
                     else:
-                        memoized_expression_memory.max_local_cost = max_local_cost
-                        memoized_expression_memory.min_local_cost = min_local_cost
-                    if max_local_cost is None or abs(max_local_cost - min_local_cost) > 1e-9:
+                        target_min_local_cost, target_max_local_cost = min_local_cost, max_local_cost
+                    if self._correct_target_violations and true_local_cost is not None:
+                        # Move a violated bound onto the true cost.
+                        if true_local_cost < target_min_local_cost:
+                            target_min_local_cost = true_local_cost
+                            lower_bounds_corrected += 1
+                        if target_max_local_cost is not None and true_local_cost > target_max_local_cost:
+                            target_max_local_cost = true_local_cost
+                            upper_bounds_corrected += 1
+                    memoized_expression_memory.min_local_cost = target_min_local_cost
+                    memoized_expression_memory.max_local_cost = target_max_local_cost
+                    if target_max_local_cost is None or abs(target_max_local_cost - target_min_local_cost) > 1e-9:
                         all_costs_exact = False
                     elif self._fully_explored_supervised and all_costs_exact:
                         child_groups = memoized_expression_memory.memoized_expression.children
@@ -1005,7 +1082,7 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
                                 break
                             child_group_costs.append(child_group_cost)
                         if all_costs_exact:
-                            total_cost = min_local_cost + sum(child_group_costs)
+                            total_cost = target_min_local_cost + sum(child_group_costs)
                             if min_exact_cost is None or total_cost < min_exact_cost:
                                 min_exact_cost = total_cost
                     local_costs_computed += 1
@@ -1028,7 +1105,70 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
             "local_costs_with_finite_upper": local_costs_with_finite_upper,
             "local_costs_with_non_zero_lower_and_finite_upper": local_costs_with_non_zero_lower_and_finite_upper,
         }
-        return local_costs_computed, exact_costs, target_bound_counts
+        cost_interval_checks = self._severity_statistics("bound_flip", bound_flip_factors, local_costs_with_finite_upper)
+        cost_interval_checks.update(self._severity_statistics("true_cardinality_violation", true_cardinality_violation_factors, true_cardinality_costs_computed))
+        cost_interval_checks.update(self._severity_statistics("true_cardinality_violation_after_flip", true_cardinality_violation_after_flip_factors, true_cardinality_costs_computed))
+        cost_interval_checks.update(self._severity_statistics("true_cardinality_lower_only_violation", true_cardinality_lower_only_violation_factors, true_cardinality_lower_only_checked))
+        cost_interval_checks["target_lower_bounds_corrected"] = lower_bounds_corrected
+        cost_interval_checks["target_upper_bounds_corrected"] = upper_bounds_corrected
+        return local_costs_computed, exact_costs, target_bound_counts, cost_interval_checks
+
+    def _true_cardinality_local_cost(self, relational_algebra_expression: RelationalAlgebraExpression) -> Optional[float]:
+        """Local cost under the true cardinality cost model, or None if the cardinality of the multiexpression is
+        unknown (scan costs would otherwise fall back to table statistics)."""
+        if self.true_cardinality_cost_model.cardinality_estimator.estimate(relational_algebra_expression.canonical_query(), cardinality_mode=CardinalityMode.MEAN) is None:
+            return None
+        return self.true_cardinality_cost_model.local_cost(relational_algebra_expression, cardinality_mode=CardinalityMode.MEAN)
+
+    def _bracket_violation_factor(self, min_local_cost: float, max_local_cost: float, probed_cost: float) -> Optional[float]:
+        """Factor by which a cost falls below the lower bound or above the upper bound, or None when
+        min_local_cost <= probed_cost <= max_local_cost. A flipped pair of bounds always violates."""
+        if probed_cost < min_local_cost:
+            return self._severity_factor(min_local_cost, probed_cost)
+        if probed_cost > max_local_cost:
+            return self._severity_factor(probed_cost, max_local_cost)
+        return None
+
+    def _severity_factor(self, larger_cost: float, smaller_cost: float) -> float:
+        """Ratio of two costs, floored like the training targets, so that its logarithm is how far the
+        two costs move the target apart. Costs below the floor are clamped before training and hence
+        have a severity of one."""
+        return max(larger_cost, self._min_local_cost) / max(smaller_cost, self._min_local_cost)
+
+    def _severity_statistics(self, name: str, severity_factors: List[float], checked: int) -> Dict[str, float]:
+        statistics: Dict[str, float] = {name + "_count": len(severity_factors), name + "_checked": checked}
+        if len(severity_factors) == 0:
+            return statistics
+        sorted_factors = sorted(severity_factors)
+        statistics[name + "_max_factor"] = sorted_factors[-1]
+        statistics[name + "_percentile_90_factor"] = sorted_factors[min(len(sorted_factors) - 1, int(0.9 * len(sorted_factors)))]
+        statistics[name + "_median_factor"] = sorted_factors[len(sorted_factors) // 2]
+        statistics[name + "_geometric_mean_factor"] = math.exp(sum(math.log(factor) for factor in sorted_factors) / len(sorted_factors))
+        statistics[name + "_above_factor_1_1"] = sum(1 for factor in sorted_factors if factor > 1.1)
+        statistics[name + "_above_factor_2"] = sum(1 for factor in sorted_factors if factor > 2)
+        statistics[name + "_above_factor_10"] = sum(1 for factor in sorted_factors if factor > 10)
+        return statistics
+
+    def _log_cost_interval_checks(self, logger: logging.Logger, cost_interval_checks: Dict[str, float]) -> None:
+        for name, description in (("bound_flip", "Local cost bound flips"),
+                                  ("true_cardinality_violation", "True cardinality cost outside [min bound, max bound]"),
+                                  ("true_cardinality_violation_after_flip", "True cardinality cost outside [min(bounds), max(bounds)]"),
+                                  ("true_cardinality_lower_only_violation", "True cardinality cost below the lower bound of targets without an upper bound")):
+            logger.info("%s: %d of %d local costs" % (description, cost_interval_checks[name + "_count"], cost_interval_checks[name + "_checked"]))
+            if cost_interval_checks[name + "_count"] == 0:
+                continue
+            logger.info("  severity factor: max %.4f, 90th percentile %.4f, median %.4f, geometric mean %.4f" % (
+                cost_interval_checks[name + "_max_factor"],
+                cost_interval_checks[name + "_percentile_90_factor"],
+                cost_interval_checks[name + "_median_factor"],
+                cost_interval_checks[name + "_geometric_mean_factor"]))
+            logger.info("  severity factor above 1.1: %d, above 2: %d, above 10: %d" % (
+                cost_interval_checks[name + "_above_factor_1_1"],
+                cost_interval_checks[name + "_above_factor_2"],
+                cost_interval_checks[name + "_above_factor_10"]))
+        if self._correct_target_violations:
+            logger.info("Training targets corrected to contain the true cardinality cost: %d lower bounds, %d upper bounds" % (
+                cost_interval_checks["target_lower_bounds_corrected"], cost_interval_checks["target_upper_bounds_corrected"]))
 
     def train(self, logger: Optional[logging.Logger] = None) -> dict:
         return self._train(logger=logger)
@@ -1057,6 +1197,7 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
 
         try:
             encoder_changed = self._encoder.update_training_queries(self._training_queries)
+            self._adapt_modules_to_encoder()
             if encoder_changed:
                 logger.info("Encoder changed, recalculating encodings.")
                 self._training_table_occurrence_encodings = {}
@@ -1117,7 +1258,7 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
                 lock.release()
 
         logger.info("Computing costs for training.")
-        local_costs_computed, exact_costs, target_bound_counts = self._compute_costs()
+        local_costs_computed, exact_costs, target_bound_counts, cost_interval_checks = self._compute_costs()
         logger.info("Cost computation complete - %s" % datetime.datetime.utcnow().isoformat())
 
         exact_cost_target_indexes: Dict[int, float] = {}
@@ -1151,6 +1292,8 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
         meta_data["local_costs_with_finite_upper"] = target_bound_counts["local_costs_with_finite_upper"]
         logger.info("Local costs with non-zero lower and finite upper: %d" % target_bound_counts["local_costs_with_non_zero_lower_and_finite_upper"])
         meta_data["local_costs_with_non_zero_lower_and_finite_upper"] = target_bound_counts["local_costs_with_non_zero_lower_and_finite_upper"]
+        self._log_cost_interval_checks(logger, cost_interval_checks)
+        meta_data.update(cost_interval_checks)
         logger.info("Total number of groups with exact costs for all plans: %d" % len(exact_costs))
         meta_data["groups_with_exact_costs"] = len(exact_costs)
         logger.info("Groups in memory: %d" % len(self._memory))
@@ -1612,6 +1755,9 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
         self._encoder.save(path)
 
     def load(self, path: str):
+        # The encoder must be loaded first: its key column vocabulary determines the module's edge layer size.
+        self._encoder.load(path)
+        self._adapt_modules_to_encoder()
         if self._double_q_learning:
             module_path_a = path + "_module_a.pt"
             module_path_b = path + "_module_b.pt"
@@ -1626,7 +1772,6 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
             optimizer_path = path + "_optimizer.pt"
             self._module.load_state_dict(torch.load(module_path, map_location=self._inference_device))
             self._optimizer.load_state_dict(torch.load(optimizer_path, map_location=self._inference_device))
-        self._encoder.load(path)
         self.trained = True
 
     @staticmethod
@@ -1688,10 +1833,46 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
                     queries.append(SPJQuery([fk1_table_occurrence, fk2_table_occurrence], [join], []))
         return queries
 
+    @staticmethod
+    def _enumerate_same_name_column_queries(schema: Schema) -> List[SPJQuery]:
+        """Two table equi-joins on columns sharing a name across tables, e.g. name.imdb_index = title.imdb_index.
+        These are neither FK-PK nor FK-FK joins, but queries do join on them."""
+        columns_by_name: Dict[str, List[Tuple[Table, Column]]] = {}
+        for table in schema.tables():
+            for column in table.columns():
+                if column.name() not in columns_by_name:
+                    columns_by_name[column.name()] = []
+                columns_by_name[column.name()].append((table, column))
+
+        # Pairs joined by a foreign key are already covered by the FK-PK enumeration, which derives tighter bounds.
+        foreign_key_pairs = set()
+        for foreign_key in schema.foreign_keys():
+            for fk_column, pk_column in foreign_key.mapping().items():
+                foreign_key_pairs.add(frozenset([(foreign_key.foreign_key_table().name(), fk_column.name()),
+                                                 (foreign_key.primary_key_table().name(), pk_column.name())]))
+
+        queries = []
+        for column_entries in columns_by_name.values():
+            for i, (table_a, column_a) in enumerate(column_entries):
+                for table_b, column_b in column_entries[i + 1:]:
+                    # Column names are unique per table, so the two tables always differ.
+                    if type(column_a.data_type()) is not type(column_b.data_type()):
+                        continue
+                    if frozenset([(table_a.name(), column_a.name()), (table_b.name(), column_b.name())]) in foreign_key_pairs:
+                        continue
+                    table_occurrence_a = TableOccurrence(table_a, table_a.name())
+                    table_occurrence_a.set_predicate(TruePredicate())
+                    table_occurrence_b = TableOccurrence(table_b, table_b.name())
+                    table_occurrence_b.set_predicate(TruePredicate())
+                    join = Join([(table_occurrence_a, column_a), (table_occurrence_b, column_b)])
+                    queries.append(SPJQuery([table_occurrence_a, table_occurrence_b], [join], []))
+        return queries
+
     def _add_statistical_cardinality_bounds(self):
         single_table_queries = self._enumerate_single_table_queries(self._schema)
         fk_pk_queries = self._enumerate_fk_pk_queries(self._schema)
         fk_fk_queries = self._enumerate_fk_fk_queries(self._schema)
+        same_name_column_queries = self._enumerate_same_name_column_queries(self._schema)
 
         # Single table queries: exact cardinality from table statistics
         for query in single_table_queries:
@@ -1723,8 +1904,8 @@ class TopDownLearnedOptimizer(TopDownOptimizer):
             self._subquery_origins[query] = query
             self._update_cardinality_ranges(query, cardinality_range)
 
-        # FK-FK joins: lower bound via MCV overlap
-        for query in fk_fk_queries:
+        # FK-FK and same name column joins: lower bound via MCV overlap
+        for query in fk_fk_queries + same_name_column_queries:
             join = list(query.joins())[0]
             equivalence_class = list(join.equivalence_class())
             to_a, col_a = equivalence_class[0]

@@ -18,7 +18,8 @@ class Experiment:
         self.description = description
         self.start_time = datetime.datetime.now()
         os.makedirs(self.result_path(), exist_ok=False)
-        logger = logging.getLogger(name)
+        logger_id = self.start_time.strftime("%Y%m%d_%H%M%S")
+        logger = logging.getLogger("%s %s" % (name, logger_id))
         logger.setLevel(logging.INFO)
         handler = logging.FileHandler(self.result_path() + "/experiment.log")
         handler.setLevel(logging.INFO)
@@ -32,6 +33,9 @@ class Experiment:
         self._debug_logger: Optional[logging.Logger] = None
 
         self._execution_error_logger = logging.getLogger("Execution Errors")
+        for execution_error_logger_handler in list(self._execution_error_logger.handlers):
+            self._execution_error_logger.removeHandler(execution_error_logger_handler)
+            execution_error_logger_handler.close()
         self._execution_error_logger.setLevel(logging.INFO)
         execution_error_handler = logging.FileHandler(self.result_path() + "/execution_errors.log")
         execution_error_handler.setLevel(logging.INFO)
@@ -106,9 +110,12 @@ class Experiment:
         optimization_end_time = datetime.datetime.now()
         if self._debug_logger is not None:
             execution_query = execution_engine.execution_query(benchmark_query.query_text, expression, "EXPLAIN (ANALYZE TRUE, VERBOSE TRUE, FORMAT JSON)")
+            if expression is None and main_optimizer.default_plan_set_commands:
+                self._debug_logger.info("Default plan settings: %s" % " ".join(main_optimizer.default_plan_set_commands))
             self._debug_logger.info("Execution query:\n%s" % execution_query)
         optimization_time = (optimization_end_time - optimization_start_time).total_seconds() * 1000
-        execution_data = execution_engine.execute(query, expression, benchmark_query=benchmark_query)
+        set_commands = main_optimizer.default_plan_set_commands if expression is None else None
+        execution_data = execution_engine.execute(query, expression, benchmark_query=benchmark_query, set_commands=set_commands)
         memorization_time = 0
         for memory_optimizer in memory_optimizers:
             if memory_optimizer == main_optimizer:

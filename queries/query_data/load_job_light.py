@@ -42,6 +42,6 @@ def load_stats_ceb(schema_id: int, filepath: str, query_db: QueryDB):
     query_db.commit()
 
 
-load_stats_ceb(1, "/home/silvan/code/job-light.sql", QueryDB("query_db", 5443))
+# load_stats_ceb(1, "/home/silvan/code/job-light.sql", QueryDB("query_db", 5443))
 
 
